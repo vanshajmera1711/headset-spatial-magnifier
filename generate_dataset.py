@@ -37,17 +37,16 @@ def parse_dns_dataset(dns_speech_dir, dns_noise_dir):
     return speech_files, noise_files
 
 def load_and_rescale_audio(file_path, target_len_samples, target_fs=16000):
-    """
-    Loads an audio file and forces it to a target sample length.
-    """
     data, fs = sf.read(file_path)
     if len(data.shape) > 1:
         data = np.mean(data, axis=1)
+    if fs != target_fs:
+        import librosa
+        data = librosa.resample(data, orig_sr=fs, target_sr=target_fs)
     if len(data) >= target_len_samples:
         return data[:target_len_samples]
     else:
         return np.pad(data, (0, target_len_samples - len(data)), 'constant')
-
 def compute_active_rms(signal):
     eps = 1e-10
     return np.sqrt(np.mean(signal**2) + eps)

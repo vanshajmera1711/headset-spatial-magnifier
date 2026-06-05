@@ -1,6 +1,10 @@
 # Ignore data folders containing heavy audio files
 data/
-DNS-Challenge/
+DNS-Challenge/datasets_fullband/
+*.wav
+*.tgz
+*.tar.bz2
+*.tar.gz
 
 # Ignore Python cache and environment files
 __pycache__/
