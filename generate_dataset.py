@@ -5,6 +5,7 @@ import os
 import random
 import json
 import glob
+import librosa
 
 def create_headset_magnifier_array(centroid_x, centroid_y, height):
     """
@@ -37,16 +38,19 @@ def parse_dns_dataset(dns_speech_dir, dns_noise_dir):
     return speech_files, noise_files
 
 def load_and_rescale_audio(file_path, target_len_samples, target_fs=16000):
+    """
+    Loads an audio file, resamples if needed, and forces it to a target sample length.
+    """
     data, fs = sf.read(file_path)
     if len(data.shape) > 1:
         data = np.mean(data, axis=1)
     if fs != target_fs:
-        import librosa
         data = librosa.resample(data, orig_sr=fs, target_sr=target_fs)
     if len(data) >= target_len_samples:
         return data[:target_len_samples]
     else:
         return np.pad(data, (0, target_len_samples - len(data)), 'constant')
+
 def compute_active_rms(signal):
     eps = 1e-10
     return np.sqrt(np.mean(signal**2) + eps)
@@ -78,13 +82,14 @@ def simulate_single_scene(sample_idx, speech_files, noise_files, output_dir):
     room.add_microphone_array(pra.MicrophoneArray(mic_matrix, room.fs))
     
     # 3. Choose Audio Assets Disjointly
-    chosen_speech = random.sample(speech_files, 2)
+    num_interferers = random.randint(1, 3)
+    chosen_speech = random.sample(speech_files, 1 + num_interferers)
     target_path = chosen_speech[0]
-    interf_path = chosen_speech[1]
+    interf_paths = chosen_speech[1:]
     noise_path = random.choice(noise_files)
-    
+
     s_target = load_and_rescale_audio(target_path, duration_samples, fs)
-    s_interf = load_and_rescale_audio(interf_path, duration_samples, fs)
+    s_interfs = [load_and_rescale_audio(p, duration_samples, fs) for p in interf_paths]
     s_noise = load_and_rescale_audio(noise_path, duration_samples, fs)
     
     # 4. Generate Random Coordinates for Sources
@@ -97,11 +102,16 @@ def simulate_single_scene(sample_idx, speech_files, noise_files, output_dir):
                 return coords
 
     target_coords = get_valid_coords()
-    interf_coords = get_valid_coords()
+    interf_coords_list = []
+    for s_interf in s_interfs:
+        ic = get_valid_coords()
+        interf_coords_list.append(ic)
+        room.add_source(ic, signal=s_interf)
     noise_coords = get_valid_coords()
-    
+
     room.add_source(target_coords, signal=s_target)
-    room.add_source(interf_coords, signal=s_interf)
+    for i, s_interf in enumerate(s_interfs):
+        room.add_source(interf_coords_list[i], signal=s_interf)
     room.add_source(noise_coords, signal=s_noise)
     
     # 5. Run Acoustic Math
@@ -110,6 +120,7 @@ def simulate_single_scene(sample_idx, speech_files, noise_files, output_dir):
     
     mixture = room.mic_array.signals
     num_mics = mic_matrix.shape[1]
+    noise_source_idx = 1 + num_interferers
     
     # 6. Isolate Ground-Truth Components
     target_spatial = np.zeros_like(mixture)
@@ -124,15 +135,16 @@ def simulate_single_scene(sample_idx, speech_files, noise_files, output_dir):
         else:
             target_spatial[m, :len(conv_t)] = conv_t
 
-        # --- Safe Interferer Convolution ---
-        conv_i = np.convolve(s_interf, room.rir[m][1])
-        if len(conv_i) >= mixture.shape[1]:
-            interf_spatial[m, :] = conv_i[:mixture.shape[1]]
-        else:
-            interf_spatial[m, :len(conv_i)] = conv_i
+        # --- Safe Interferer Convolution (sum all interferers) ---
+        for i, s_interf in enumerate(s_interfs):
+            conv_i = np.convolve(s_interf, room.rir[m][1 + i])
+            if len(conv_i) >= mixture.shape[1]:
+                interf_spatial[m, :] += conv_i[:mixture.shape[1]]
+            else:
+                interf_spatial[m, :len(conv_i)] += conv_i
 
         # --- Safe Noise Convolution ---
-        conv_n = np.convolve(s_noise, room.rir[m][2])
+        conv_n = np.convolve(s_noise, room.rir[m][noise_source_idx])
         if len(conv_n) >= mixture.shape[1]:
             noise_spatial[m, :] = conv_n[:mixture.shape[1]]
         else:
@@ -174,7 +186,8 @@ def simulate_single_scene(sample_idx, speech_files, noise_files, output_dir):
         "snr_db": target_snr_db,
         "headset_centroid": [c_x, c_y, c_z],
         "target_position": target_coords.tolist(),
-        "interferer_position": interf_coords.tolist()
+        "num_interferers": num_interferers,
+        "interferer_positions": [ic.tolist() for ic in interf_coords_list]
     }
     with open(f"{output_dir}/sample_{sample_idx}_meta.json", "w") as f:
         json.dump(meta_data, f, indent=4)
