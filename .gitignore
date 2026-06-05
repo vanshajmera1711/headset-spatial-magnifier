@@ -1,0 +1,13 @@
+# Ignore data folders containing heavy audio files
+data/
+DNS-Challenge/
+
+# Ignore Python cache and environment files
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Ignore IDE settings
+.vscode/
+.idea/
