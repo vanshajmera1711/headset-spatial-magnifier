@@ -5,7 +5,7 @@
     "output_dataset_dir": "data/simulated",
     "sample_rate": 16000,
     "clip_duration_seconds": 4.0,
-    "total_training_samples": 5000,
+    "total_training_samples": 10,
     "sir_range_db": [-5.0, 5.0],
     "snr_range_db": [0.0, 15.0],
     "rt60_range_seconds": [0.2, 0.8]
