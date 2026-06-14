@@ -11,19 +11,10 @@
 # +-- noise_fullband 
 
 BLOB_NAMES=(
-    noise_fullband/datasets_fullband.noise_fullband.audioset_000.tar.bz2
-    noise_fullband/datasets_fullband.noise_fullband.audioset_001.tar.bz2
-    noise_fullband/datasets_fullband.noise_fullband.audioset_002.tar.bz2
-    noise_fullband/datasets_fullband.noise_fullband.audioset_003.tar.bz2
-    noise_fullband/datasets_fullband.noise_fullband.audioset_004.tar.bz2
-    noise_fullband/datasets_fullband.noise_fullband.audioset_005.tar.bz2
-    noise_fullband/datasets_fullband.noise_fullband.audioset_006.tar.bz2
-
+   
     noise_fullband/datasets_fullband.noise_fullband.freesound_000.tar.bz2
-    noise_fullband/datasets_fullband.noise_fullband.freesound_001.tar.bz2
-
-    datasets_fullband.impulse_responses_000.tar.bz2
-)
+    
+   )
 
 ###############################################################
 
@@ -40,10 +31,10 @@ do
 
     # DRY RUN: print HTTP response and Content-Length
     # WITHOUT downloading the files
-    curl -s -I "$URL" | head -n 2
+    # curl -s -I "$URL" | head -n 2
 
     # Actually download the files: UNCOMMENT when ready to download
-    # curl "$URL" -o "$OUTPUT_PATH/$BLOB"
+     curl "$URL" -o "$OUTPUT_PATH/$BLOB"
 
     # Same as above, but using wget
     # wget "$URL" -O "$OUTPUT_PATH/$BLOB"
