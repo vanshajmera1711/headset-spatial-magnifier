@@ -6,6 +6,7 @@ import random
 import json
 import glob
 import librosa
+from tqdm import tqdm
 
 
 def create_safe_headphone_physical_array(centroid_x, centroid_y, height):
@@ -225,3 +226,16 @@ def simulate_single_scene(sample_idx, speech_files, noise_files, output_dir):
     }
     with open(f"{output_dir}/sample_{sample_idx}_meta.json", "w") as f:
         json.dump(meta_data, f, indent=4)
+
+if __name__ == "__main__":
+    DNS_SPEECH_DIR = "C:/projects/headset-spatial-magnifier/data/datasets_fullband/clean_fullband/mnt/dnsv5/clean/vctk_wav48_silence_trimmed/mnt/input/clean_fullband/vctk_wav48_silence_trimmed"
+    DNS_NOISE_DIR  = "C:/projects/headset-spatial-magnifier/data/datasets_fullband/noise_fullband"
+    OUTPUT_DIR     = "C:/projects/headset-spatial-magnifier/data/generated_dataset"
+    NUM_SAMPLES    = 1000  
+    speech_files, noise_files = parse_dns_dataset(DNS_SPEECH_DIR, DNS_NOISE_DIR)
+    print(f"Found {len(speech_files)} speech files, {len(noise_files)} noise files")
+
+    for i in tqdm(range(NUM_SAMPLES), desc="Generating", unit="sample"):
+        simulate_single_scene(i, speech_files, noise_files, OUTPUT_DIR)
+
+    print("All samples generated.")

@@ -47,15 +47,16 @@ def compute_si_snr(estimate, reference, epsilon=1e-8):
     si_snr_val = 10 * torch.log10(target_pow / (error_pow + epsilon))
     return si_snr_val.mean().item()
 
+
+# 3. CONFIGURATION & DIRECTORIES (UPDATED)
 # ==========================================
-# 3. CONFIGURATION & DIRECTORIES
-# ==========================================
-INPUT_FOLDER  = r"C:\Users\Admin\room_simulation\data\simulated"
-OUTPUT_FOLDER = r"C:\Users\Admin\room_simulation\data\dsbf_output"
-METRICS_FOLDER = r"C:\Users\Admin\room_simulation\data"
+# Points directly to your generated 1000-sample dataset repository paths
+INPUT_FOLDER  = r"C:\projects\headset-spatial-magnifier\data\generated_dataset"
+OUTPUT_FOLDER = r"C:\projects\headset-spatial-magnifier\data\dsbf_output"
+METRICS_FOLDER = r"C:\projects\headset-spatial-magnifier\data"
 
 SAMPLE_RATE       = 16000
-REFERENCE_CHANNEL = 1   # Aligned to our master evaluation channel
+REFERENCE_CHANNEL = 1   # Aligned to our master evaluation channel (left_front)
 N_FFT = 1024
 N_HOP = 256
 

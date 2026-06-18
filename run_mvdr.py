@@ -1,202 +1,253 @@
 import os
 import json
-import torch
-import torchaudio
+import numpy as np
 import soundfile as sf
+import scipy.signal as signal
+from concurrent.futures import ProcessPoolExecutor
+from tqdm import tqdm
 
 # ==========================================
-# 1. BULLETPROOF SOUNDFILE PATCHES 
+# 1. CONFIGURATION & PATHS
 # ==========================================
-def soundfile_load_patch(filepath, frame_offset=0, num_frames=-1, convert=True, channels_first=True):
-    data, samplerate = sf.read(filepath, start=frame_offset, frames=num_frames, dtype='float32', always_2d=True)
-    tensor = torch.from_numpy(data)
-    if channels_first:
-        tensor = tensor.t()
-    return tensor, samplerate
+DATA_DIR = "C:/projects/headset-spatial-magnifier/data"
+INPUT_FOLDER = os.path.join(DATA_DIR, "generated_dataset")
+OUTPUT_FOLDER = os.path.join(DATA_DIR, "mvdr_output")
+METRICS_PATH = os.path.join(DATA_DIR, "mvdr_metrics.json")
 
-def soundfile_save_patch(filepath, src, sample_rate, channels_first=True, bits_per_sample=16, format=None, encoding=None):
-    if channels_first and src.ndim > 1:
-        data = src.t().numpy()
-    else:
-        data = src.numpy()
-    sf.write(filepath, data, sample_rate, subtype=f'PCM_{bits_per_sample}')
+SAMPLE_RATE = 16000
+FFT_LENGTH = 512
+FFT_SHIFT = 256   # 50% overlap
+N_BINS = FFT_LENGTH // 2 + 1
+REFERENCE_CHANNEL = 1  # left_front anchor channel
 
-torchaudio.load = soundfile_load_patch
-torchaudio.save = soundfile_save_patch
-
-# ==========================================
-# 2. EXACT SI-SNR METRIC COMPUTATION
-# ==========================================
-def compute_si_snr(estimate, reference, epsilon=1e-8):
-    estimate = estimate - estimate.mean()
-    reference = reference - reference.mean()
-    
-    min_len = min(estimate.shape[-1], reference.shape[-1])
-    estimate = estimate[..., :min_len]
-    reference = reference[..., :min_len]
-    
-    reference_pow = reference.pow(2).sum(dim=-1, keepdim=True)
-    mix_pow = (estimate * reference).sum(dim=-1, keepdim=True)
-    scale = mix_pow / (reference_pow + epsilon)
-
-    target = scale * reference
-    error = estimate - target
-
-    target_pow = target.pow(2).sum(dim=-1)
-    error_pow = error.pow(2).sum(dim=-1)
-
-    si_snr_val = 10 * torch.log10(target_pow / (error_pow + epsilon))
-    return si_snr_val.mean().item()
-
-# ==========================================
-# 3. CONFIGURATION & DIRECTORIES
-# ==========================================
-INPUT_FOLDER = r"C:\Users\Admin\room_simulation\data\simulated" 
-OUTPUT_FOLDER = r"C:\Users\Admin\room_simulation\data\mvdr_output"
-METRICS_FOLDER = r"C:\Users\Admin\room_simulation\data"
-
-SAMPLE_RATE = 16000  
-REFERENCE_CHANNEL = 1  # Aligned to our master evaluation channel 
-N_FFT = 1024
-N_HOP = 256
+SPEED_OF_SOUND = 343.0  # m/s
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-os.makedirs(METRICS_FOLDER, exist_ok=True)
-
-stft = torchaudio.transforms.Spectrogram(n_fft=N_FFT, hop_length=N_HOP, power=None)
-istft = torchaudio.transforms.InverseSpectrogram(n_fft=N_FFT, hop_length=N_HOP)
-psd_transform = torchaudio.transforms.PSD()
-mvdr_transform = torchaudio.transforms.SoudenMVDR()
 
 # ==========================================
-# 4. FIXED PROCESSING LOOP FOR TARGET_GT STEMS
+# 2. GEOMETRY RECONSTRUCTION
 # ==========================================
-all_files = os.listdir(INPUT_FOLDER)
+def reconstruct_mic_positions(centroid):
+    """
+    Reconstructs the 6-channel triangular mic array 3D coordinates from the centroid.
+    """
+    cx, cy, height = centroid
+    mics = np.array([
+        [cx - 0.08,  cy,        height + 0.03], # ch 0 - left_top
+        [cx - 0.08,  cy + 0.02, height       ], # ch 1 - left_front
+        [cx - 0.08,  cy - 0.02, height       ], # ch 2 - left_back
+        [cx + 0.08,  cy - 0.02, height       ], # ch 3 - right_back
+        [cx + 0.08,  cy + 0.02, height       ], # ch 4 - right_front
+        [cx + 0.08,  cy,        height + 0.03]  # ch 5 - right_top
+    ])
+    return mics
 
-# Gather only the true mixture files based on your directory structure
-mixture_files = [f for f in all_files if f.endswith("_mix.wav") or (f.endswith("_mix") and not f.endswith(".json"))]
-
-# If extensions are hidden in your OS view, fall back to matching the base string safely
-if not mixture_files:
-    mixture_files = [f for f in all_files if f.endswith("_mix")]
-
-scenes_processed = 0
-total_sisnr_in = 0.0
-total_sisnr_out = 0.0
-metrics_log = {}
-
-print(f"Starting analysis on dataset mixtures inside: {INPUT_FOLDER}\n")
-
-for filename in mixture_files:
-    # Handle files whether they have extensions explicitly appended or hidden
-    base_ext = ".wav" if filename.endswith(".wav") else ""
-    file_path = os.path.join(INPUT_FOLDER, filename if base_ext else f"{filename}.wav")
+# ==========================================
+# 3. SI-SNR EVALUATION METRIC
+# ==========================================
+def compute_si_snr_numpy(estimate, reference, epsilon=1e-8):
+    estimate = estimate - np.mean(estimate)
+    reference = reference - np.mean(reference)
     
-    # Map directly to your explicit target_gt file naming convention
-    target_filename = filename.replace("_mix", "_target_gt")
-    target_path = os.path.join(INPUT_FOLDER, target_filename if base_ext else f"{target_filename}.wav")
+    min_len = min(len(estimate), len(reference))
+    estimate = estimate[:min_len]
+    reference = reference[:min_len]
     
-    # Security check: verify both files exist on disk before moving forward
-    if not (os.path.exists(file_path) and os.path.exists(target_path)):
-        continue
+    ref_pow = np.sum(reference ** 2)
+    dot_prod = np.sum(estimate * reference)
+    scale = dot_prod / (ref_pow + epsilon)
+    
+    target = scale * reference
+    error = estimate - target
+    
+    target_pow = np.sum(target ** 2)
+    error_pow = np.sum(error ** 2)
+    
+    return 10 * np.log10(target_pow / (error_pow + epsilon))
 
+# ==========================================
+# 4. CORE ENGINE WITH REAL BLIND MVDR
+# ==========================================
+def process_single_sample(sample_idx):
     try:
-        # Load audio signals
-        waveform_mix, sr = torchaudio.load(file_path)
-        waveform_clean, sr_c = torchaudio.load(target_path)
+        # File paths
+        meta_path = os.path.join(INPUT_FOLDER, f"sample_{sample_idx}_meta.json")
+        mix_path = os.path.join(INPUT_FOLDER, f"sample_{sample_idx}_mix.wav")
+        tgt_path = os.path.join(INPUT_FOLDER, f"sample_{sample_idx}_target_gt.wav")
+        out_path = os.path.join(OUTPUT_FOLDER, f"enhanced_sample_{sample_idx}_mix.wav")
         
-        if waveform_mix.shape[0] < 2:
-            continue  # Requires multi-channel data
-
-        # Dynamic Noise Field Isolation (Mix - Target = Combined Clutter)
-        # Pads/truncates to ensure exact shape alignment before subtraction
-        min_samples = min(waveform_mix.shape[-1], waveform_clean.shape[-1])
-        waveform_mix = waveform_mix[:, :min_samples]
-        waveform_clean = waveform_clean[:, :min_samples]
+        if not (os.path.exists(meta_path) and os.path.exists(mix_path) and os.path.exists(tgt_path)):
+            return {"sample_idx": sample_idx, "status": "missing_files"}
         
-        total_noise_field = waveform_mix - waveform_clean
-
-        # Isolate anchor reference channel arrays (Channel 1)
-        clean_ref = waveform_clean[REFERENCE_CHANNEL:REFERENCE_CHANNEL+1]
-        mix_ref = waveform_mix[REFERENCE_CHANNEL:REFERENCE_CHANNEL+1]
+        # Load Metadata & Reconstruct Array Physics
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
         
-        # Calculate True Base Input SI-SNR
-        sisnr_in = compute_si_snr(mix_ref, clean_ref)
-
-        # Process MVDR
-        waveform_mix_double = waveform_mix.to(torch.double)
-        stft_mix = stft(waveform_mix_double)
+        centroid = meta["headset_centroid"]
+        target_pos = np.array(meta["target_position"])
+        mic_positions = reconstruct_mic_positions(centroid)
         
-        # Compute Power Spectral Density matrices using the isolated tracks
-        stft_target = stft(waveform_clean.to(torch.double))
-        stft_noise_field = stft(total_noise_field.to(torch.double))
+        # Load Audio (Crop to 64000 samples to strip convolution tails cleanly)
+        mix, sr = sf.read(mix_path, frames=64000, dtype='float32')
+        tgt, _  = sf.read(tgt_path, frames=64000, dtype='float32')
         
-        target_mag = stft_target.abs()[REFERENCE_CHANNEL]
-        noise_mag = stft_noise_field.abs()[REFERENCE_CHANNEL]
+        # Calculate Input Metrics on Reference Channel
+        mix_ref = mix[:, REFERENCE_CHANNEL]
+        tgt_ref = tgt[:, REFERENCE_CHANNEL]
+        sisnr_in = compute_si_snr_numpy(mix_ref, tgt_ref)
         
-        # Ideal Mask Assignment
-        irm_speech = (target_mag > noise_mag).to(torch.double)
-        irm_noise = (target_mag <= noise_mag).to(torch.double)
+        # STFT transformation: (Channels, Bins, Frames)
+        f, t, stft_mix = signal.stft(mix.T, fs=SAMPLE_RATE, nperseg=FFT_LENGTH, noverlap=FFT_SHIFT)
+        n_channels, n_bins, n_frames = stft_mix.shape
         
-        # Compute spatial covariance matrices
-        psd_speech = psd_transform(stft_mix, irm_speech)
-        psd_noise = psd_transform(stft_mix, irm_noise)
+        # RELATIVE TIME DIFFERENCE OF ARRIVAL (TDOA) FORMULATION
+        absolute_distances = np.linalg.norm(mic_positions - target_pos, axis=1) # (6,)
+        absolute_delays = absolute_distances / SPEED_OF_SOUND # (6,)
         
-        # Souden Beamformer Execution
-        stft_souden = mvdr_transform(stft_mix, psd_speech, psd_noise, reference_channel=REFERENCE_CHANNEL)
-        waveform_souden = istft(stft_souden, length=waveform_mix.shape[-1])
-        waveform_souden = waveform_souden.reshape(1, -1).to(torch.float32)
+        # Lock relative delays to anchor channel 1
+        relative_delays = absolute_delays - absolute_delays[REFERENCE_CHANNEL] # (6,)
         
-        # Calculate True Output SI-SNR
-        sisnr_out = compute_si_snr(waveform_souden, clean_ref)
-        sisnr_imp = sisnr_out - sisnr_in
+        # Frequency vector corresponding to the STFT bins
+        freqs = np.arange(n_bins) * (SAMPLE_RATE / FFT_LENGTH) # (257,)
+        
+        # Construct the phase matching matrix using relative time offsets
+        steering_vector = np.exp(-1j * 2 * np.pi * freqs[None, :] * relative_delays[:, None])
+        
+        # Blind Noise Covariance Tracking initialization
+        R_noise = np.zeros((n_channels, n_channels, n_bins), dtype=np.complex64)
+        for b in range(n_bins):
+            R_noise[:, :, b] = np.eye(n_channels) * 1e-3
+            
+        power_fast = np.zeros(n_bins)
+        power_slow = np.zeros(n_bins)
+        
+        # Process Frame-by-Frame Causally (Bins fully vectorized)
+        enhanced_spec = np.zeros((n_bins, n_frames), dtype=np.complex64)
+        I_batch = np.tile(np.eye(n_channels)[None, :, :], (n_bins, 1, 1))
+        
+        for t_idx in range(n_frames):
+            X_t = stft_mix[:, :, t_idx] # Shape: (6, 257)
+            
+            # Fast/Slow energy tracking for VAD proxy
+            current_energy = np.abs(X_t[REFERENCE_CHANNEL, :]) ** 2
+            if t_idx == 0:
+                power_fast = current_energy
+                power_slow = current_energy
+            else:
+                power_fast = 0.4 * current_energy + (1 - 0.4) * power_fast
+                power_slow = 0.98 * current_energy + (1 - 0.98) * power_slow
+                
+            # Vectorized outer-product across all bins: shape (6, 6, 257)
+            X_outer = np.einsum('if,jf->ijf', X_t, np.conj(X_t))
+            
+            # Mask generation: Update noise space only during low-energy moments
+            noise_mask = (power_fast <= 1.05 * power_slow).astype(np.float32)
+            
+            # Update R_noise via broadcasting
+            alpha_tensor = 0.95 * noise_mask + 1.0 * (1 - noise_mask)
+            R_noise = alpha_tensor[None, None, :] * R_noise + (1 - alpha_tensor[None, None, :]) * X_outer
+            
+            # Rearrange dimensions for batched matrix operation: (6, 6, 257) -> (257, 6, 6)
+            R_batch = np.moveaxis(R_noise, 2, 0)
+            
+            # ACTIVE BLIND MVDR PROCESSING TRACKS COVARIANCE SHIFT
+            R_batch = R_batch + 1e-3 * I_batch  # Apply stable static diagonal floor
+            
+            # Batched inversion: handles all 257 bins simultaneously in C
+            R_inv_batch = np.linalg.pinv(R_batch) # Shape: (257, 6, 6)
+            
+            # Batched weight computation formulation
+            d_batch = np.moveaxis(steering_vector, 1, 0)[:, :, None] # Shape: (257, 6, 1)
+            numerator_batch = R_inv_batch @ d_batch                  # Shape: (257, 6, 1)
+            
+            d_H_batch = np.conj(np.moveaxis(d_batch, 2, 1))          # Shape: (257, 1, 6)
+            denominator_batch = d_H_batch @ numerator_batch          # Shape: (257, 1, 1)
+            
+            w_batch = np.squeeze(numerator_batch / (denominator_batch + 1e-8), axis=-1) # (257, 6)
+            
+            # Apply Filter to all bins at once
+            enhanced_spec[:, t_idx] = np.einsum('fi,if->f', np.conj(w_batch), X_t)
+                
+        # ISTFT reconstruction
+        _, enhanced_waveform = signal.istft(enhanced_spec, fs=SAMPLE_RATE, nperseg=FFT_LENGTH, noverlap=FFT_SHIFT)
+        enhanced_waveform = enhanced_waveform[:len(tgt_ref)]
+        
+        # Calculate Output Metrics
+        sisnr_out = compute_si_snr_numpy(enhanced_waveform, tgt_ref)
         
         # Save Enhanced File
-        output_path = os.path.join(OUTPUT_FOLDER, f"enhanced_{filename if base_ext else f'{filename}.wav'}")
-        torchaudio.save(output_path, waveform_souden, SAMPLE_RATE)
+        sf.write(out_path, enhanced_waveform, SAMPLE_RATE)
         
-        # Update metrics
-        scenes_processed += 1
-        total_sisnr_in += sisnr_in
-        total_sisnr_out += sisnr_out
-        
-        metrics_log[filename] = {
-            "sisnr_input": round(sisnr_in, 2),
-            "sisnr_output": round(sisnr_out, 2),
-            "sisnr_improvement": round(sisnr_imp, 2)
+        return {
+            "sample_idx": sample_idx,
+            "status": "success",
+            "sisnr_input": float(sisnr_in),
+            "sisnr_output": float(sisnr_out),
+            "sisnr_improvement": float(sisnr_out - sisnr_in)
         }
-        print(f"Processed scene {scenes_processed}: {filename} (Gain: {sisnr_imp:+.2f} dB)")
-
+        
     except Exception as e:
-        print(f"Error handling file {filename}: {str(e)}")
-
+        return {"sample_idx": sample_idx, "status": f"failed: {str(e)}"}
 
 # ==========================================
-# 5. GENERATE FINAL METRICS & CONSOLE PRINT
+# 5. MULTIPROCESSING ORCHESTRATOR
 # ==========================================
-if scenes_processed > 0:
-    mean_in = total_sisnr_in / scenes_processed
-    mean_out = total_sisnr_out / scenes_processed
-    mean_imp = mean_out - mean_in
-else:
-    mean_in, mean_out, mean_imp = 0.0, 0.0, 0.0
-
-metrics_json_path = os.path.join(METRICS_FOLDER, "mvdr_metrics.json")
-summary_data = {
-    "scenes_processed": scenes_processed,
-    "mean_sisnr_input_db": round(mean_in, 2),
-    "mean_sisnr_output_db": round(mean_out, 2),
-    "mean_sisnr_improvement_db": round(mean_imp, 2),
-    "per_file_metrics": metrics_log
-}
-
-with open(metrics_json_path, "w") as f:
-    json.dump(summary_data, f, indent=4)
-
-print("\n--- MVDR Results ---")
-print(f"Scenes processed : {scenes_processed}")
-print(f"Mean SI-SNR input : {mean_in:.2f} dB")
-print(f"Mean SI-SNR output: {mean_out:.2f} dB")
-print(f"Mean SI-SNR improvement: {mean_imp:.2f} dB")
-print(f"Outputs saved to: data/mvdr_output")
-print(f"Metrics saved to: data/mvdr_metrics.json")
+if __name__ == "__main__":
+    NUM_SAMPLES = 1000
+    sample_indices = list(range(NUM_SAMPLES))
+    
+    num_workers = os.cpu_count()
+    print(f"Executing Blind MVDR Engine via parallel pools across {num_workers} cores...")
+    
+    results = []
+    
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        list_of_results = list(tqdm(
+            executor.map(process_single_sample, sample_indices),
+            total=NUM_SAMPLES,
+            desc="MVDR (Causal, blind)"
+        ))
+        
+    # Aggregate and serialize metrics
+    valid_scenes = 0
+    total_in = 0.0
+    total_out = 0.0
+    per_file_log = {}
+    
+    for res in list_of_results:
+        if res["status"] == "success":
+            valid_scenes += 1
+            total_in += res["sisnr_input"]
+            total_out += res["sisnr_output"]
+            
+            per_file_log[f"sample_{res['sample_idx']}"] = {
+                "sisnr_input": float(res["sisnr_input"]),
+                "sisnr_output": float(res["sisnr_output"]),
+                "sisnr_improvement": float(res["sisnr_improvement"])
+            }
+            
+    if valid_scenes > 0:
+        mean_in = total_in / valid_scenes
+        mean_out = total_out / valid_scenes
+        mean_imp = mean_out - mean_in
+    else:
+        mean_in, mean_out, mean_imp = 0.0, 0.0, 0.0
+        
+    summary_data = {
+        "scenes_processed": valid_scenes,
+        "mean_sisnr_input_db": round(float(mean_in), 2),
+        "mean_sisnr_output_db": round(float(mean_out), 2),
+        "mean_sisnr_improvement_db": round(float(mean_imp), 2),
+        "per_file_metrics": per_file_log
+    }
+    
+    with open(METRICS_PATH, "w") as f:
+        json.dump(summary_data, f, indent=4)
+        
+    print("\n" + "─" * 40 + "\n Summary \n" + "─" * 40)
+    print(f"  Mean SI-SNR input       : {mean_in:.2f} dB")
+    print(f"  Mean SI-SNR output      : {mean_out:.2f} dB")
+    print(f"  Mean SI-SNR improvement : {mean_imp:.2f} dB")
+    print(f"  Samples processed       : {valid_scenes}")
+    print(f"\nMetrics saved → {METRICS_PATH}")
+    print(f"Enhanced audio saved → {OUTPUT_FOLDER}")
