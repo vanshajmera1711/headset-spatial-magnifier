@@ -1,5 +1,5 @@
-import json
 import os
+import json
 import numpy as np
 import soundfile as sf
 import scipy.signal as signal
@@ -48,21 +48,21 @@ def reconstruct_mic_positions(centroid):
 def compute_si_snr_numpy(estimate, reference, epsilon=1e-8):
     estimate = estimate - np.mean(estimate)
     reference = reference - np.mean(reference)
-
+    
     min_len = min(len(estimate), len(reference))
     estimate = estimate[:min_len]
     reference = reference[:min_len]
-
+    
     ref_pow = np.sum(reference ** 2)
     dot_prod = np.sum(estimate * reference)
     scale = dot_prod / (ref_pow + epsilon)
-
+    
     target = scale * reference
     error = estimate - target
-
+    
     target_pow = np.sum(target ** 2)
     error_pow = np.sum(error ** 2)
-
+    
     return 10 * np.log10(target_pow / (error_pow + epsilon))
 
 # ==========================================
@@ -75,132 +75,139 @@ def process_single_sample(sample_idx):
         mix_path = os.path.join(INPUT_FOLDER, f"sample_{sample_idx}_mix.wav")
         tgt_path = os.path.join(INPUT_FOLDER, f"sample_{sample_idx}_target_gt.wav")
         out_path = os.path.join(OUTPUT_FOLDER, f"enhanced_sample_{sample_idx}_mix.wav")
-
+        
         if not (os.path.exists(meta_path) and os.path.exists(mix_path) and os.path.exists(tgt_path)):
             return {"sample_idx": sample_idx, "status": "missing_files"}
-
+        
         # Load Metadata & Reconstruct Array Physics
         with open(meta_path, "r") as f:
             meta = json.load(f)
-
+        
         centroid = meta["headset_centroid"]
         target_pos = np.array(meta["target_position"])
         mic_positions = reconstruct_mic_positions(centroid)
-
+        
         # Load Audio (Crop to 64000 samples to strip convolution tails cleanly)
         mix, sr = sf.read(mix_path, frames=64000, dtype='float32')
         tgt, _  = sf.read(tgt_path, frames=64000, dtype='float32')
-
+        
         # Calculate Input Metrics on Reference Channel
         mix_ref = mix[:, REFERENCE_CHANNEL]
         tgt_ref = tgt[:, REFERENCE_CHANNEL]
         sisnr_in = compute_si_snr_numpy(mix_ref, tgt_ref)
-
+        
         # STFT transformation: (Channels, Bins, Frames)
         f, t, stft_mix = signal.stft(mix.T, fs=SAMPLE_RATE, nperseg=FFT_LENGTH, noverlap=FFT_SHIFT)
         n_channels, n_bins, n_frames = stft_mix.shape
-
+        
         # NEAR-FIELD STEERING VECTOR (spherical wave model)
-        # Far-field plane-wave delay-only steering breaks down at these distances
-        # (~16-20cm mouth-to-mic, comparable to the array's own 16cm aperture).
-        # Spherical wave model: each mic sees amplitude ~ 1/r AND phase ~ delay(r).
         absolute_distances = np.linalg.norm(mic_positions - target_pos, axis=1) # (6,)
         absolute_delays = absolute_distances / SPEED_OF_SOUND # (6,)
-
-        # Lock relative delays to anchor channel 1 (phase term, same as before)
+        
         relative_delays = absolute_delays - absolute_delays[REFERENCE_CHANNEL] # (6,)
-
-        # Relative amplitude attenuation term (1/r), normalized to reference channel
-        # so the reference channel's steering entry stays unit magnitude --
-        # keeps the MVDR unit-gain constraint w^H d = 1 anchored the same way
-        # as the original phase-only formulation.
         relative_amplitude = absolute_distances[REFERENCE_CHANNEL] / absolute_distances # (6,)
-
-        # Frequency vector corresponding to the STFT bins
+        
         freqs = np.arange(n_bins) * (SAMPLE_RATE / FFT_LENGTH) # (257,)
-
-        # Construct the near-field steering vector: amplitude term * phase term
+        
         steering_vector = (
             relative_amplitude[:, None]
             * np.exp(-1j * 2 * np.pi * freqs[None, :] * relative_delays[:, None])
         )
-
+        
         # Blind Noise Covariance Tracking initialization
         R_noise = np.zeros((n_channels, n_channels, n_bins), dtype=np.complex64)
         for b in range(n_bins):
-            R_noise[:, :, b] = np.eye(n_channels) * 1e-5
+            R_noise[:, :, b] = np.eye(n_channels) * 1e-3
 
-        power_fast = np.zeros(n_bins)
-        power_slow = np.zeros(n_bins)
+        EPSILON_FLOOR = 1e-10  
 
+        ild_fast = np.zeros(n_bins)
+        ild_slow = np.zeros(n_bins)
+        raw_energy_floor = np.zeros(n_bins)
+        
         # Process Frame-by-Frame Causally (Bins fully vectorized)
         enhanced_spec = np.zeros((n_bins, n_frames), dtype=np.complex64)
         I_batch = np.tile(np.eye(n_channels)[None, :, :], (n_bins, 1, 1))
-
+        
         for t_idx in range(n_frames):
             X_t = stft_mix[:, :, t_idx] # Shape: (6, 257)
 
-            # Fast/Slow energy tracking for VAD proxy
-            current_energy = np.abs(X_t[REFERENCE_CHANNEL, :]) ** 2
-            EPSILON_FLOOR = 1e-10  # numerical floor — prevents power_slow underflow → inf ratio → frozen R_noise
+            # ILD-spread computation
+            chan_mag = np.abs(X_t)                        # (6, 257)
+            mean_mag = np.mean(chan_mag, axis=0)           # (257,)
+            std_mag = np.std(chan_mag, axis=0)             # (257,)
+            current_ild = std_mag / (mean_mag + EPSILON_FLOOR)  # (257,)
 
             if t_idx == 0:
-                power_fast = current_energy + EPSILON_FLOOR
-                power_slow = current_energy + EPSILON_FLOOR
+                ild_fast = current_ild + EPSILON_FLOOR
+                ild_slow = current_ild + EPSILON_FLOOR
             else:
-                power_fast = 0.4 * current_energy + (1 - 0.4) * power_fast
-                power_slow = 0.98 * current_energy + (1 - 0.98) * power_slow
-                power_slow = np.maximum(power_slow, EPSILON_FLOOR)
-                power_fast = np.maximum(power_fast, EPSILON_FLOOR)
-
-            # Vectorized outer-product across all bins: shape (6, 6, 257)
+                ild_fast = 0.4 * current_ild + (1 - 0.4) * ild_fast
+                ild_slow = 0.98 * current_ild + (1 - 0.98) * ild_slow
+                ild_fast = np.maximum(ild_fast, EPSILON_FLOOR)
+                ild_slow = np.maximum(ild_slow, EPSILON_FLOOR)
+                
             X_outer = np.einsum('if,jf->ijf', X_t, np.conj(X_t))
+            
+            # --- DUAL-CONSTRAINT GATING LOGIC ---
+            # Gate 1: Far-field indicator (Low spatial ILD spread across earcups)
+            ild_gate = (ild_fast <= 1.2 * ild_slow)
+            
+            # Gate 2: Absolute reference energy threshold to block early reflections/echoes
+            current_energy = np.abs(X_t[REFERENCE_CHANNEL, :]) ** 2
+            if t_idx == 0:
+                raw_energy_floor = current_energy
+            else:
+                # Tracking ambient background baseline minimum stats cleanly
+                raw_energy_floor = np.minimum(raw_energy_floor, current_energy * 1.5)
+            
+            energy_gate = (current_energy <= 2.5 * raw_energy_floor)
+            
+            # Strictly update noise tracking space only when both gates agree it's background noise
+            if sample_idx == 0 and t_idx % 50 == 0:
+                print(f"frame {t_idx}: ild_fast(bin10)={ild_fast[10]:.4f}, "
+                      f"ild_slow(bin10)={ild_slow[10]:.4f}, "
+                      f"ratio={ild_fast[10]/ild_slow[10]:.3f}, "
+                      f"frac_noise_bins={(ild_fast <= 1.3*ild_slow).mean():.2f}, "
+                      f"mean_ild_fast_all_bins={ild_fast.mean():.4f}")
+            noise_mask = (ild_gate & energy_gate).astype(np.float32)
 
-            # Mask generation: Update noise space only during low-energy moments
-            noise_mask = (power_fast <= 1.02 * power_slow).astype(np.float32)
-
-            # Update R_noise via broadcasting
-            alpha_tensor = 0.95 * noise_mask + 1.0 * (1 - noise_mask)
+            # Smoothly integrate noise matrix (Alpha=0.10 for stable background assimilation)
+            alpha_tensor = 0.10 * noise_mask + 1.0 * (1 - noise_mask)
             R_noise = alpha_tensor[None, None, :] * R_noise + (1 - alpha_tensor[None, None, :]) * X_outer
-
-            # Rearrange dimensions for batched matrix operation: (6, 6, 257) -> (257, 6, 6)
+            
+            # Rearrange dimensions for batched matrix operation
             R_batch = np.moveaxis(R_noise, 2, 0)
-
-            # ACTIVE BLIND MVDR PROCESSING TRACKS COVARIANCE SHIFT
-            eps = np.maximum(1e-5 * np.mean(np.abs(R_batch)), 1e-7)
-            R_batch = R_batch + eps * I_batch  # Apply stable static diagonal floor
-
-            # Batched inversion: handles all 257 bins simultaneously in C
-            R_inv_batch = np.linalg.pinv(R_batch) # Shape: (257, 6, 6)
-
+            
+            # Stabilized dynamic diagonal loading matrix floor
+            eps = np.maximum(1e-6 * np.mean(np.abs(R_batch)), 1e-4)
+            R_batch = R_batch + eps * I_batch  
+            
+            # Batched inversion
+            R_inv_batch = np.linalg.pinv(R_batch) 
+            
             # Batched weight computation formulation
-            d_batch = np.moveaxis(steering_vector, 1, 0)[:, :, None] # Shape: (257, 6, 1)
-            numerator_batch = R_inv_batch @ d_batch                  # Shape: (257, 6, 1)
-
-            d_H_batch = np.conj(np.moveaxis(d_batch, 2, 1))          # Shape: (257, 1, 6)
-            denominator_batch = d_H_batch @ numerator_batch          # Shape: (257, 1, 1)
-
-            w_batch = np.squeeze(numerator_batch / (denominator_batch + 1e-8), axis=-1) # (257, 6)
-
-            # Apply Filter to all bins at once
+            d_batch = np.moveaxis(steering_vector, 1, 0)[:, :, None] 
+            numerator_batch = R_inv_batch @ d_batch                  
+            
+            d_H_batch = np.conj(np.moveaxis(d_batch, 2, 1))          
+            denominator_batch = d_H_batch @ numerator_batch          
+            
+            w_batch = np.squeeze(numerator_batch / (denominator_batch + 1e-5), axis=-1) 
+            
+            # Apply spatial coefficients to all bins
             enhanced_spec[:, t_idx] = np.einsum('fi,if->f', np.conj(w_batch), X_t)
-
-            # If this is the very first sample, save the true live matrices for plotting
-        if sample_idx == 0:
-            np.save(os.path.join(DATA_DIR, "true_R_noise.npy"), R_noise)
-            np.save(os.path.join(DATA_DIR, "true_steering.npy"), steering_vector)
-            print("\n[INFO] Successfully dumped true live data matrices for Sample 0!")
-
+                
         # ISTFT reconstruction
         _, enhanced_waveform = signal.istft(enhanced_spec, fs=SAMPLE_RATE, nperseg=FFT_LENGTH, noverlap=FFT_SHIFT)
         enhanced_waveform = enhanced_waveform[:len(tgt_ref)]
-
+        
         # Calculate Output Metrics
         sisnr_out = compute_si_snr_numpy(enhanced_waveform, tgt_ref)
-
+        
         # Save Enhanced File
         sf.write(out_path, enhanced_waveform, SAMPLE_RATE)
-
+        
         return {
             "sample_idx": sample_idx,
             "status": "success",
@@ -208,7 +215,7 @@ def process_single_sample(sample_idx):
             "sisnr_output": float(sisnr_out),
             "sisnr_improvement": float(sisnr_out - sisnr_in)
         }
-
+        
     except Exception as e:
         return {"sample_idx": sample_idx, "status": f"failed: {str(e)}"}
 
@@ -218,44 +225,44 @@ def process_single_sample(sample_idx):
 if __name__ == "__main__":
     NUM_SAMPLES = 1000
     sample_indices = list(range(NUM_SAMPLES))
-
+    
     num_workers = os.cpu_count()
     print(f"Executing Blind MVDR Engine via parallel pools across {num_workers} cores...")
-
+    
     results = []
-
+    
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         list_of_results = list(tqdm(
             executor.map(process_single_sample, sample_indices),
             total=NUM_SAMPLES,
             desc="MVDR (Causal, blind)"
         ))
-
+        
     # Aggregate and serialize metrics
     valid_scenes = 0
     total_in = 0.0
     total_out = 0.0
     per_file_log = {}
-
+    
     for res in list_of_results:
         if res["status"] == "success":
             valid_scenes += 1
             total_in += res["sisnr_input"]
             total_out += res["sisnr_output"]
-
+            
             per_file_log[f"sample_{res['sample_idx']}"] = {
                 "sisnr_input": float(res["sisnr_input"]),
                 "sisnr_output": float(res["sisnr_output"]),
                 "sisnr_improvement": float(res["sisnr_improvement"])
             }
-
+            
     if valid_scenes > 0:
         mean_in = total_in / valid_scenes
         mean_out = total_out / valid_scenes
         mean_imp = mean_out - mean_in
     else:
         mean_in, mean_out, mean_imp = 0.0, 0.0, 0.0
-
+        
     summary_data = {
         "scenes_processed": valid_scenes,
         "mean_sisnr_input_db": round(float(mean_in), 2),
@@ -263,10 +270,10 @@ if __name__ == "__main__":
         "mean_sisnr_improvement_db": round(float(mean_imp), 2),
         "per_file_metrics": per_file_log
     }
-
+    
     with open(METRICS_PATH, "w") as f:
         json.dump(summary_data, f, indent=4)
-
+        
     print("\n" + "─" * 40 + "\n Summary \n" + "─" * 40)
     print(f"  Mean SI-SNR input       : {mean_in:.2f} dB")
     print(f"  Mean SI-SNR output      : {mean_out:.2f} dB")
