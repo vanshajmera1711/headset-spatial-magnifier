@@ -38,7 +38,7 @@ from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 
 DATA_DIR = "C:/projects/headset-spatial-magnifier/data"
-INPUT_FOLDER = os.path.join(DATA_DIR, "generated_dataset")
+INPUT_FOLDER = os.path.join(DATA_DIR, "generated_dataset_reverb")
 ENHANCED_FOLDER = os.path.join(DATA_DIR, "mvdr_output")   # enhanced_sample_N_mix.wav
 METRICS_OUT = os.path.join(DATA_DIR, "extended_metrics.json")
 PLOTS_DIR = os.path.join(DATA_DIR, "evaluation_plots")

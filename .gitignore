@@ -15,3 +15,41 @@ __pycache__/
 # Ignore IDE settings
 .vscode/
 .idea/
+# Audio formats
+*.wav
+*.flac
+*.mp3
+*.m4a
+
+# Deep learning models & checkpoints
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.bin
+*.npy
+*.npz
+
+# Logs & temporary outputs
+*.log
+runs/
+wandb/
+__pycache__/
+*.pyc
+test_output/
+headset_test_output/
+
+# Dataset folders (modify/add folder names containing datasets)
+data/
+datasets/
+datasets_fullband/
+DNS-Challenge/
+# Ignore all log and checkpoint folders at any depth
+**/logs/
+**/lightning_logs/
+**/runs/
+**/wandb/
+**/checkpoints/
+**/*.ckpt
+**/*.pt
+**/*.pth

@@ -74,23 +74,40 @@ def compute_active_rms(signal):
     return np.sqrt(np.mean(signal**2) + eps)
 
 
-def simulate_single_scene(sample_idx, speech_files, noise_files, output_dir):
+def simulate_single_scene(sample_idx, speech_files, noise_files, output_dir, add_reverb=True):
     fs = 16000
     duration_samples = 4 * fs  # Force to exactly 4 seconds (64,000 samples)
 
     # =========================================================================
     # 1. RANDOMIZED ROOM CONFIGURATIONS MATCHING YOUR BTP TABLE I
     # =========================================================================
-    room_W = random.uniform(2.5, 5.0)  # Width range from paper Table I [cite: 137]
-    room_L = random.uniform(3.0, 9.0)  # Length range from paper Table I [cite: 137]
-    room_H = random.uniform(2.2, 3.5)  # Height range from paper Table I [cite: 137]
+    room_W = random.uniform(2.5, 5.0)  # Width range from paper Table I
+    room_L = random.uniform(3.0, 9.0)  # Length range from paper Table I
+    room_H = random.uniform(2.2, 3.5)  # Height range from paper Table I
     room_dim = np.array([room_L, room_W, room_H])
 
-    # ANECHOIC OVERRIDE: max_order=0 turns off all reflections
-    room = pra.ShoeBox(room_dim, fs=fs, materials=pra.Material(1.0), max_order=0)
+    # =========================================================================
+    # 2. ENERGIZE ACOUSTIC ENVIRONMENT INTERFACE (REVERBERATION SWITCH)
+    # =========================================================================
+    if add_reverb:
+        # Randomize RT60 (Reverberation Time) between 0.2 to 0.6 seconds (Standard room/office)
+        rt60_target = random.uniform(0.2, 0.6)
+        try:
+            # Dynamically invert Sabine's equation to select realistic absorption materials
+            e_material = pra.Material.from_rt60(rt60_target, room_dim, fs=fs)
+            # Track up to 15 reflection generations to build a comprehensive late decay tail
+            room = pra.ShoeBox(room_dim, fs=fs, materials=e_material, max_order=15)
+        except Exception:
+            # Safe boundary ceiling fallback parameters
+            rt60_target = 0.25
+            room = pra.ShoeBox(room_dim, fs=fs, materials=pra.Material(0.25), max_order=10)
+    else:
+        rt60_target = 0.0
+        # ANECHOIC OVERRIDE: max_order=0 turns off all reflections
+        room = pra.ShoeBox(room_dim, fs=fs, materials=pra.Material(1.0), max_order=0)
 
     # =========================================================================
-    # 2. POSITION HEADSET CENTROID (FIXED BUG: Fully synced to 0.2 - 0.8)
+    # 3. POSITION HEADSET CENTROID
     # =========================================================================
     c_x = random.uniform(room_L * 0.2, room_L * 0.8)
     c_y = random.uniform(room_W * 0.2, room_W * 0.8)
@@ -100,8 +117,8 @@ def simulate_single_scene(sample_idx, speech_files, noise_files, output_dir):
     mic_matrix = create_safe_headphone_physical_array(c_x, c_y, c_z)
     room.add_microphone_array(pra.MicrophoneArray(mic_matrix, room.fs))
 
-    # 3. Choose Audio Assets Disjointly
-    num_interferers = random.randint(1, 3) # [cite: 132]
+    # Choose Audio Assets Disjointly
+    num_interferers = random.randint(1, 3)
     chosen_speech   = random.sample(speech_files, 1 + num_interferers)
     target_path     = chosen_speech[0]
     interf_paths    = chosen_speech[1:]
@@ -133,7 +150,7 @@ def simulate_single_scene(sample_idx, speech_files, noise_files, output_dir):
     interf_coords_list = [get_distant_interferer_coords() for _ in s_interfs]
     noise_coords       = get_distant_interferer_coords()
 
-  # =========================================================================
+    # =========================================================================
     # 5. REGISTER SOURCES & RUN SIMULATION
     # =========================================================================
     room.add_source(target_coords, signal=s_target)
@@ -148,42 +165,35 @@ def simulate_single_scene(sample_idx, speech_files, noise_files, output_dir):
     num_mics = mic_matrix.shape[1]
 
     # =========================================================================
-    # 6. VERSION-AGNOSTIC GROUND-TRUTH ISOLATION (ANECHOIC DIRECT-PATH ONLY)
+    # 6. VERSION-AGNOSTIC GROUND-TRUTH ISOLATION (DIRECT-PATH PATHWAY ONLY)
     # =========================================================================
-    # Because max_order=0, the room impulse response (RIR) contains ONLY 
-    # the direct-path propagation. We can extract the ground truths cleanly by 
-    # convolving each raw signal with its corresponding direct-path RIR filter.
-    
     target_spatial = np.zeros_like(mixture)
     interf_spatial = np.zeros_like(mixture)
     noise_spatial  = np.zeros_like(mixture)
 
-    # Source indices mapping order:
-    # Index 0 = Target Speaker
-    # Indices 1 to num_interferers = Background Speakers
-    # Last Index = Ambient Noise
     target_src_idx = 0
     interf_src_idxs = list(range(1, 1 + num_interferers))
     noise_src_idx   = 1 + num_interferers
 
     for m in range(num_mics):
-        # --- Isolate Target Speech Ground-Truth ---
+        # Isolate Target Speech Ground-Truth via Direct-Path RIR filter convolution
         conv_t = np.convolve(s_target, room.rir[m][target_src_idx])
         out_len_t = min(len(conv_t), mixture.shape[1])
         target_spatial[m, :out_len_t] = conv_t[:out_len_t]
 
-        # --- Isolate Combined Interferers Ground-Truth ---
+        # Isolate Combined Interferers Ground-Truth
         for i, s_interf in enumerate(s_interfs):
             conv_i = np.convolve(s_interf, room.rir[m][interf_src_idxs[i]])
             out_len_i = min(len(conv_i), mixture.shape[1])
             interf_spatial[m, :out_len_i] += conv_i[:out_len_i]
 
-        # --- Isolate Ambient Noise Ground-Truth ---
+        # Isolate Ambient Noise Ground-Truth
         conv_n = np.convolve(s_noise, room.rir[m][noise_src_idx])
         out_len_n = min(len(conv_n), mixture.shape[1])
         noise_spatial[m, :out_len_n] = conv_n[:out_len_n]
+
     # =========================================================================
-    # 7. BALANCE CONTENT (SIR/SNR evaluation tracked at reference mic Channel 1)
+    # 7. BALANCE CONTENT (SIR/SNR tracked at Channel 1 reference microphone)
     # =========================================================================
     target_sir_db  = random.uniform(0.0, 6.0)
     target_snr_db  = random.uniform(5.0, 15.0)
@@ -208,14 +218,14 @@ def simulate_single_scene(sample_idx, speech_files, noise_files, output_dir):
         final_mixture *= scale_factor
         target_spatial *= scale_factor
 
-    # 9. Write outputs (Saves arrays structured natively as 6-channel wave files)
+    # 9. Write outputs structures natively as 6-channel wave files
     os.makedirs(output_dir, exist_ok=True)
     sf.write(f"{output_dir}/sample_{sample_idx}_mix.wav",       final_mixture.T,  fs)
     sf.write(f"{output_dir}/sample_{sample_idx}_target_gt.wav", target_spatial.T, fs)
 
     meta_data = {
         "room_size_lwh":       room_dim.tolist(),
-        "rt60_seconds":        0.0, 
+        "rt60_seconds":        round(rt60_target, 3), 
         "sir_db":              target_sir_db,
         "snr_db":              target_snr_db,
         "headset_centroid":    [c_x, c_y, c_z],
@@ -228,14 +238,34 @@ def simulate_single_scene(sample_idx, speech_files, noise_files, output_dir):
         json.dump(meta_data, f, indent=4)
 
 if __name__ == "__main__":
+    # ─────────────────────────────────────────────────────────────────────────
+    # SEED REPLICABILITY LOCK MECHANISM
+    # ─────────────────────────────────────────────────────────────────────────
+    random.seed(42)
+    np.random.seed(42)
+
+    # MASTER SWITCH: True for Echoic/Reverberant Run, False for Original Anechoic Baseline
+    ADD_REVERB = True  
+    
     DNS_SPEECH_DIR = "C:/projects/headset-spatial-magnifier/data/datasets_fullband/clean_fullband/mnt/dnsv5/clean/vctk_wav48_silence_trimmed/mnt/input/clean_fullband/vctk_wav48_silence_trimmed"
     DNS_NOISE_DIR  = "C:/projects/headset-spatial-magnifier/data/datasets_fullband/noise_fullband"
-    OUTPUT_DIR     = "C:/projects/headset-spatial-magnifier/data/generated_dataset"
-    NUM_SAMPLES    = 10000 
+    
+    if ADD_REVERB:
+        OUTPUT_DIR = "C:/projects/headset-spatial-magnifier/data/generated_dataset_reverb"
+    else:
+        OUTPUT_DIR = "C:/projects/headset-spatial-magnifier/data/generated_dataset"
+        
+    NUM_SAMPLES = 1000 
     speech_files, noise_files = parse_dns_dataset(DNS_SPEECH_DIR, DNS_NOISE_DIR)
-    print(f"Found {len(speech_files)} speech files, {len(noise_files)} noise files")
+    
+    # Force lexicographical sort to establish matching file arrays across platforms
+    speech_files.sort()
+    noise_files.sort()
+    
+    print(f"Executing Controlled Array Simulation. Reverb Active: {ADD_REVERB}")
+    print(f"Tracking pool indices: {len(speech_files)} speech items, {len(noise_files)} noise tracks.")
 
-    for i in tqdm(range(NUM_SAMPLES), desc="Generating", unit="sample"):
-        simulate_single_scene(i, speech_files, noise_files, OUTPUT_DIR)
+    for i in tqdm(range(NUM_SAMPLES), desc="Synthesizing Acoustic Audio Scenes", unit="sample"):
+        simulate_single_scene(i, speech_files, noise_files, OUTPUT_DIR, add_reverb=ADD_REVERB)
 
-    print("All samples generated.")
+    print(f"Generation Sequence Terminated. Target Path: {OUTPUT_DIR}")

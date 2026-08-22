@@ -1,0 +1,43 @@
+
+seed: 42
+
+logging:
+  tb_log_dir: "./logs/"
+  # ckpt_dir: "./logs/ckpts"
+
+data:
+  n_channels: 3
+  batch_size: 64
+  prep_files: {
+                data: C:/projects/headset-spatial-magnifier/data/prep_mix_ch3_dataset3.hdf5,
+                meta: C:/projects/headset-spatial-magnifier/data/prep_mix_meta_ch3_dataset3.json,
+              }
+  dry_target: True
+  snr_range: []
+  meta_frame_length: 64000
+  stft_length_samples: 512
+  stft_shift_samples: 256
+  n_workers: 4
+  pin_memory: True
+  
+  
+
+network:
+    n_channels: 3
+
+experiment:
+  learning_rate: 0.001
+  weight_decay: 0
+  loss_alpha: 10
+  cirm_comp_K: 1
+  cirm_comp_C: 1
+  reference_channel: 0
+
+training:
+  max_epochs: 100
+  gradient_clip_val: 0
+  gradient_clip_algorithm: value
+  strategy: auto
+  accelerator: gpu
+  devices: 1
+  precision: "16-mixed"
